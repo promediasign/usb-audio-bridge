@@ -1,7 +1,6 @@
 package com.usbaudio.bridge;
 
 import android.app.Notification;
-import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
@@ -16,7 +15,6 @@ import android.util.Log;
 
 public class AudioService extends Service {
     private static final String TAG = "AudioService";
-    private static final String CHANNEL_ID = "AudioChannel";
     
     private AudioRecord audioRecord;
     private AudioTrack audioTrack;
@@ -33,15 +31,15 @@ public class AudioService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
-        createNotificationChannel();
+        // No notification channel needed for Android 7
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         Log.d(TAG, "Service starting");
         
-        // Start foreground immediately
-        Notification notification = new Notification.Builder(this, CHANNEL_ID)
+        // Create simple notification (no channel for Android 7)
+        Notification notification = new Notification.Builder(this)
                 .setContentTitle("USB Audio Bridge")
                 .setContentText("Starting...")
                 .setSmallIcon(android.R.drawable.ic_btn_speak_now)
@@ -177,25 +175,12 @@ public class AudioService extends Service {
     private void updateNotification(String text) {
         NotificationManager manager = getSystemService(NotificationManager.class);
         if (manager != null) {
-            Notification notification = new Notification.Builder(this, CHANNEL_ID)
+            Notification notification = new Notification.Builder(this)
                     .setContentTitle("USB Audio Bridge")
                     .setContentText(text)
                     .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                     .build();
             manager.notify(1, notification);
-        }
-    }
-
-    private void createNotificationChannel() {
-        NotificationChannel channel = new NotificationChannel(
-                CHANNEL_ID,
-                "Audio Service",
-                NotificationManager.IMPORTANCE_LOW
-        );
-        
-        NotificationManager manager = getSystemService(NotificationManager.class);
-        if (manager != null) {
-            manager.createNotificationChannel(channel);
         }
     }
 
