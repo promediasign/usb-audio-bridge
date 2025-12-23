@@ -125,19 +125,43 @@ public class AudioService extends Service {
                 Log.d(TAG, "Audio routing started @ " + SAMPLE_RATE + " Hz");
                 updateNotification("Running @ 11kHz");
                 
-                // Main loop - EXACT SAME AS WORKING APP
-                while (isRecording) {
-                    // Read from microphone/USB
-                    int bytesRead = audioRecord.read(buffer, 0, buffer.length);
-                    
-                    if (bytesRead > 0) {
-                        // Write directly to speaker
-                        audioTrack.write(buffer, 0, bytesRead);
-                    } else if (bytesRead < 0) {
-                        Log.e(TAG, "Read error: " + bytesRead);
-                        Thread.sleep(100);
-                    }
-                }
+                // Main loop with detailed logging
+int loopCount = 0;
+int errorCount = 0;
+while (isRecording) {
+    loopCount++;
+    
+    // Read from microphone/USB
+    int bytesRead = audioRecord.read(buffer, 0, buffer.length);
+    
+    if (bytesRead > 0) {
+        // Write directly to speaker
+        int written = audioTrack.write(buffer, 0, bytesRead);
+        
+        // Log every 1000 loops (~10 seconds)
+        if (loopCount % 1000 == 0) {
+            Log.d(TAG, "Loop " + loopCount + ": read=" + bytesRead + ", written=" + written);
+        }
+    } else if (bytesRead == 0) {
+        errorCount++;
+        Log.w(TAG, "Read returned 0 bytes (count: " + errorCount + ")");
+        if (errorCount > 100) {
+            Log.e(TAG, "Too many zero reads, exiting");
+            break;
+        }
+        Thread.sleep(10);
+    } else {
+        errorCount++;
+        Log.e(TAG, "Read error: " + bytesRead + " (count: " + errorCount + ")");
+        if (errorCount > 100) {
+            Log.e(TAG, "Too many errors, exiting");
+            break;
+        }
+        Thread.sleep(100);
+    }
+}
+
+Log.d(TAG, "Audio loop exited. loopCount=" + loopCount + ", errorCount=" + errorCount);
                 
             } catch (Exception e) {
                 Log.e(TAG, "Audio error", e);
