@@ -21,24 +21,23 @@ public class AudioService extends Service {
     private Thread audioThread;
     private volatile boolean isRecording = false;
     
-    // EXACT SAME VALUES AS WORKING APP
-    private static final int SAMPLE_RATE = 11025; // 0x2b11 from working app
-    private static final int CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_STEREO; // 2
-    private static final int AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT; // 2
-    private static final int RECORD_SOURCE = MediaRecorder.AudioSource.MIC; // 1
-    private static final int STREAM_TYPE = AudioManager.STREAM_MUSIC; // 3
+    // CORRECT VALUES FOR YOUR USB DEVICE
+    private static final int SAMPLE_RATE = 96000; // 96kHz (your USB device)
+    private static final int CHANNEL_IN = AudioFormat.CHANNEL_IN_MONO; // MONO input
+    private static final int CHANNEL_OUT = AudioFormat.CHANNEL_OUT_STEREO; // STEREO output
+    private static final int AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT;
+    private static final int RECORD_SOURCE = MediaRecorder.AudioSource.MIC;
+    private static final int STREAM_TYPE = AudioManager.STREAM_MUSIC;
 
     @Override
     public void onCreate() {
         super.onCreate();
-        // No notification channel needed for Android 7
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         Log.d(TAG, "Service starting");
         
-        // Create simple notification (no channel for Android 7)
         Notification notification = new Notification.Builder(this)
                 .setContentTitle("USB Audio Bridge")
                 .setContentText("Starting...")
@@ -58,41 +57,33 @@ public class AudioService extends Service {
         isRecording = true;
         
         audioThread = new Thread(() -> {
-            // Set high priority like working app
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
             
             try {
-                // Get buffer sizes - EXACT SAME AS WORKING APP
-                int recBufferSize = AudioRecord.getMinBufferSize(
-                    SAMPLE_RATE, 
-                    CHANNEL_CONFIG, 
-                    AUDIO_FORMAT
-                );
+                // Get buffer sizes
+                int bufferSizeIn = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_IN, AUDIO_FORMAT);
+                int bufferSizeOut = AudioTrack.getMinBufferSize(SAMPLE_RATE, CHANNEL_OUT, AUDIO_FORMAT);
                 
-                int playBufferSize = AudioTrack.getMinBufferSize(
-                    SAMPLE_RATE,
-                    AudioFormat.CHANNEL_OUT_STEREO,
-                    AUDIO_FORMAT
-                );
+                Log.d(TAG, "Config: 96kHz, MONO input, STEREO output");
+                Log.d(TAG, "Buffer sizes - In: " + bufferSizeIn + ", Out: " + bufferSizeOut);
                 
-                Log.d(TAG, "Buffer sizes - Record: " + recBufferSize + ", Play: " + playBufferSize);
-                
-                if (recBufferSize <= 0 || playBufferSize <= 0) {
+                if (bufferSizeIn <= 0 || bufferSizeOut <= 0) {
                     Log.e(TAG, "Invalid buffer sizes");
                     updateNotification("Error: Invalid buffer");
                     return;
                 }
                 
-                // Create buffer
-                byte[] buffer = new byte[recBufferSize];
+                // Buffers: mono input, stereo output (2x size)
+                short[] monoBuffer = new short[bufferSizeIn / 2]; // 16-bit = 2 bytes per sample
+                short[] stereoBuffer = new short[bufferSizeIn]; // Double for stereo
                 
-                // Create AudioTrack FIRST (like working app)
+                // Create AudioTrack FIRST
                 audioTrack = new AudioTrack(
-                    STREAM_TYPE,           // 3 - STREAM_MUSIC
-                    SAMPLE_RATE,           // 11025
-                    AudioFormat.CHANNEL_OUT_STEREO, // stereo output
-                    AUDIO_FORMAT,          // PCM_16BIT
-                    playBufferSize,
+                    STREAM_TYPE,
+                    SAMPLE_RATE,
+                    CHANNEL_OUT, // STEREO output
+                    AUDIO_FORMAT,
+                    bufferSizeOut,
                     AudioTrack.MODE_STREAM
                 );
                 
@@ -102,13 +93,13 @@ public class AudioService extends Service {
                     return;
                 }
                 
-                // Create AudioRecord SECOND (like working app)
+                // Create AudioRecord SECOND
                 audioRecord = new AudioRecord(
-                    RECORD_SOURCE,         // 1 - MIC
-                    SAMPLE_RATE,           // 11025
-                    CHANNEL_CONFIG,        // STEREO
-                    AUDIO_FORMAT,          // PCM_16BIT
-                    recBufferSize
+                    RECORD_SOURCE,
+                    SAMPLE_RATE,
+                    CHANNEL_IN, // MONO input
+                    AUDIO_FORMAT,
+                    bufferSizeIn
                 );
                 
                 if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
@@ -118,50 +109,42 @@ public class AudioService extends Service {
                     return;
                 }
                 
-                // Start recording THEN playback (like working app)
+                // Start recording and playback
                 audioRecord.startRecording();
                 audioTrack.play();
                 
-                Log.d(TAG, "Audio routing started @ " + SAMPLE_RATE + " Hz");
-                updateNotification("Running @ 11kHz");
+                Log.d(TAG, "Audio routing started @ 96kHz, MONO→STEREO");
+                updateNotification("Running @ 96kHz");
                 
-                // Main loop with detailed logging
-int loopCount = 0;
-int errorCount = 0;
-while (isRecording) {
-    loopCount++;
-    
-    // Read from microphone/USB
-    int bytesRead = audioRecord.read(buffer, 0, buffer.length);
-    
-    if (bytesRead > 0) {
-        // Write directly to speaker
-        int written = audioTrack.write(buffer, 0, bytesRead);
-        
-        // Log every 1000 loops (~10 seconds)
-        if (loopCount % 1000 == 0) {
-            Log.d(TAG, "Loop " + loopCount + ": read=" + bytesRead + ", written=" + written);
-        }
-    } else if (bytesRead == 0) {
-        errorCount++;
-        Log.w(TAG, "Read returned 0 bytes (count: " + errorCount + ")");
-        if (errorCount > 100) {
-            Log.e(TAG, "Too many zero reads, exiting");
-            break;
-        }
-        Thread.sleep(10);
-    } else {
-        errorCount++;
-        Log.e(TAG, "Read error: " + bytesRead + " (count: " + errorCount + ")");
-        if (errorCount > 100) {
-            Log.e(TAG, "Too many errors, exiting");
-            break;
-        }
-        Thread.sleep(100);
-    }
-}
-
-Log.d(TAG, "Audio loop exited. loopCount=" + loopCount + ", errorCount=" + errorCount);
+                // Main loop with MONO to STEREO conversion
+                int loopCount = 0;
+                while (isRecording) {
+                    loopCount++;
+                    
+                    // Read MONO samples
+                    int samplesRead = audioRecord.read(monoBuffer, 0, monoBuffer.length);
+                    
+                    if (samplesRead > 0) {
+                        // Convert MONO to STEREO (duplicate each sample)
+                        for (int i = 0; i < samplesRead; i++) {
+                            stereoBuffer[i * 2] = monoBuffer[i];      // Left
+                            stereoBuffer[i * 2 + 1] = monoBuffer[i];  // Right
+                        }
+                        
+                        // Write STEREO to speakers
+                        audioTrack.write(stereoBuffer, 0, samplesRead * 2);
+                        
+                        // Log every 1000 loops
+                        if (loopCount % 1000 == 0) {
+                            Log.d(TAG, "Loop " + loopCount + ": " + samplesRead + " mono samples → " + (samplesRead*2) + " stereo");
+                        }
+                    } else if (samplesRead < 0) {
+                        Log.e(TAG, "Read error: " + samplesRead);
+                        Thread.sleep(100);
+                    }
+                }
+                
+                Log.d(TAG, "Audio loop exited normally");
                 
             } catch (Exception e) {
                 Log.e(TAG, "Audio error", e);
