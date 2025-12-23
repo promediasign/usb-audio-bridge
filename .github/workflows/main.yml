@@ -34,7 +34,7 @@ jobs:
           -storepass ${{ secrets.KEYSTORE_PASSWORD }} \
           -keypass ${{ secrets.KEYSTORE_PASSWORD }} \
           app/build/outputs/apk/debug/app-debug.apk \
-          key0
+          upload
     
     - name: Verify Signature
       run: jarsigner -verify app/build/outputs/apk/debug/app-debug.apk
