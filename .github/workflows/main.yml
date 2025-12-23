@@ -1,4 +1,4 @@
-name: Build APK
+name: Build Signed APK
 
 on:
   push:
@@ -25,8 +25,28 @@ jobs:
     - name: Build with Gradle
       run: ./gradlew assembleDebug
       
-    - name: Upload APK
+    - name: Sign APK
+      run: |
+        jarsigner -verbose \
+          -sigalg SHA256withRSA \
+          -digestalg SHA-256 \
+          -keystore signing-key.keystore \
+          -storepass ${{ secrets.KEYSTORE_PASSWORD }} \
+          -keypass ${{ secrets.KEYSTORE_PASSWORD }} \
+          app/build/outputs/apk/debug/app-debug.apk \
+          key0
+    
+    - name: Verify Signature
+      run: jarsigner -verify app/build/outputs/apk/debug/app-debug.apk
+    
+    - name: Align APK
+      run: |
+        $ANDROID_HOME/build-tools/34.0.0/zipalign -v 4 \
+          app/build/outputs/apk/debug/app-debug.apk \
+          usb-audio-bridge.apk
+    
+    - name: Upload Signed APK
       uses: actions/upload-artifact@v4
       with:
-        name: app-debug
-        path: app/build/outputs/apk/debug/app-debug.apk
+        name: usb-audio-bridge-signed
+        path: usb-audio-bridge.apk
