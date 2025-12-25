@@ -71,7 +71,7 @@ public class AudioService extends Service {
             Log.d(TAG, "Watchdog started");
             while (isRecording) {
                 try {
-                    Thread.sleep(10000); // Check every 10 seconds
+                    Thread.sleep(3000); // Check every 3 seconds
                     
                     if (isRestarting) {
                         continue; // Skip check during restart
@@ -79,7 +79,7 @@ public class AudioService extends Service {
                     
                     long timeSinceLastLoop = System.currentTimeMillis() - lastLoopTime;
                     
-                    if (lastLoopTime > 0 && timeSinceLastLoop > 15000) {
+                    if (lastLoopTime > 0 && timeSinceLastLoop > 6000) {
                         Log.w(TAG, "WATCHDOG: Audio hung for " + timeSinceLastLoop + "ms, restarting...");
                         restartAudio();
                     }
