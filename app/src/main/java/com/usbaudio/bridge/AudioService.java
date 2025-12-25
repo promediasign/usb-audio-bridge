@@ -18,15 +18,16 @@ import android.util.Log;
 public class AudioService extends Service {
     private static final String TAG = "AudioService";
     
-    private AudioRecord audioRecord;
-    private AudioTrack audioTrack;
+    private volatile AudioRecord audioRecord;
+    private volatile AudioTrack audioTrack;
     private Thread audioThread;
     private Thread watchdogThread;
     private volatile boolean isRecording = false;
     private volatile long lastLoopTime = 0;
     private PowerManager.WakeLock wakeLock;
+    private final Object audioLock = new Object();
+    private volatile boolean isRestarting = false;
     
-    // CORRECT VALUES FOR YOUR USB DEVICE
     private static final int SAMPLE_RATE = 96000;
     private static final int CHANNEL_IN = AudioFormat.CHANNEL_IN_MONO;
     private static final int CHANNEL_OUT = AudioFormat.CHANNEL_OUT_STEREO;
@@ -39,7 +40,6 @@ public class AudioService extends Service {
         super.onCreate();
         Log.d(TAG, "Service created");
         
-        // Acquire WakeLock to prevent sleep
         PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
         wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AudioService::WakeLock");
         wakeLock.acquire();
@@ -52,7 +52,7 @@ public class AudioService extends Service {
         
         Notification notification = new Notification.Builder(this)
                 .setContentTitle("USB Audio Bridge")
-                .setContentText("Starting...")
+                .setContentText("Running @ 96kHz")
                 .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                 .build();
         
@@ -71,15 +71,16 @@ public class AudioService extends Service {
             Log.d(TAG, "Watchdog started");
             while (isRecording) {
                 try {
-                    Thread.sleep(15000); // Check every 15 seconds
+                    Thread.sleep(10000); // Check every 10 seconds
+                    
+                    if (isRestarting) {
+                        continue; // Skip check during restart
+                    }
                     
                     long timeSinceLastLoop = System.currentTimeMillis() - lastLoopTime;
                     
-                    if (lastLoopTime > 0 && timeSinceLastLoop > 20000) {
-                        Log.e(TAG, "WATCHDOG: Audio thread hung! Last loop was " + timeSinceLastLoop + "ms ago");
-                        Log.e(TAG, "WATCHDOG: Restarting audio...");
-                        
-                        // Force restart
+                    if (lastLoopTime > 0 && timeSinceLastLoop > 15000) {
+                        Log.w(TAG, "WATCHDOG: Audio hung for " + timeSinceLastLoop + "ms, restarting...");
                         restartAudio();
                     }
                     
@@ -93,28 +94,42 @@ public class AudioService extends Service {
     }
 
     private void restartAudio() {
-        Log.d(TAG, "Restarting audio routing...");
-        isRecording = false;
+        if (isRestarting) {
+            Log.d(TAG, "Restart already in progress, skipping");
+            return;
+        }
         
-        // Wait for thread to exit
-        if (audioThread != null) {
+        isRestarting = true;
+        
+        new Thread(() -> {
             try {
-                audioThread.interrupt();
-                audioThread.join(3000);
-            } catch (InterruptedException e) {
-                Log.e(TAG, "Error waiting for audio thread", e);
+                Log.d(TAG, "=== RESTART BEGIN ===");
+                
+                // Signal stop but don't interrupt yet
+                isRecording = false;
+                
+                // Wait a moment for loop to notice
+                Thread.sleep(100);
+                
+                // Now cleanup with lock
+                synchronized (audioLock) {
+                    cleanup();
+                }
+                
+                // Wait for USB to settle
+                Thread.sleep(300);
+                
+                // Restart
+                startAudioRouting();
+                
+                Log.d(TAG, "=== RESTART COMPLETE ===");
+                
+            } catch (Exception e) {
+                Log.e(TAG, "Restart error", e);
+            } finally {
+                isRestarting = false;
             }
-        }
-        
-        cleanup();
-        
-        // Restart
-        try {
-            Thread.sleep(1000);
-        } catch (InterruptedException e) {
-        }
-        
-        startAudioRouting();
+        }).start();
     }
 
     private void startAudioRouting() {
@@ -125,164 +140,107 @@ public class AudioService extends Service {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
             
             try {
-                // Get buffer sizes
                 int bufferSizeIn = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_IN, AUDIO_FORMAT);
                 int bufferSizeOut = AudioTrack.getMinBufferSize(SAMPLE_RATE, CHANNEL_OUT, AUDIO_FORMAT);
                 
-                Log.d(TAG, "Config: 96kHz, MONO input, STEREO output");
-                Log.d(TAG, "Buffer sizes - In: " + bufferSizeIn + ", Out: " + bufferSizeOut);
+                Log.d(TAG, "Buffers - In: " + bufferSizeIn + ", Out: " + bufferSizeOut);
                 
                 if (bufferSizeIn <= 0 || bufferSizeOut <= 0) {
                     Log.e(TAG, "Invalid buffer sizes");
-                    updateNotification("Error: Invalid buffer");
                     return;
                 }
                 
-                // Buffers
                 short[] monoBuffer = new short[bufferSizeIn / 2];
                 short[] stereoBuffer = new short[bufferSizeIn];
                 
-                // Create AudioTrack
-                audioTrack = new AudioTrack(
-                    STREAM_TYPE,
-                    SAMPLE_RATE,
-                    CHANNEL_OUT,
-                    AUDIO_FORMAT,
-                    bufferSizeOut,
-                    AudioTrack.MODE_STREAM
-                );
-                
-                if (audioTrack.getState() != AudioTrack.STATE_INITIALIZED) {
-                    Log.e(TAG, "AudioTrack init failed");
-                    updateNotification("Error: AudioTrack");
-                    return;
-                }
-                
-                // Create AudioRecord
-                audioRecord = new AudioRecord(
-                    RECORD_SOURCE,
-                    SAMPLE_RATE,
-                    CHANNEL_IN,
-                    AUDIO_FORMAT,
-                    bufferSizeIn
-                );
-                
-                if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
-                    Log.e(TAG, "AudioRecord init failed");
-                    cleanup();
-                    updateNotification("Error: AudioRecord");
-                    return;
-                }
-                
-                // Start
-                audioRecord.startRecording();
-                audioTrack.play();
-                
-                Log.d(TAG, "Audio routing started @ 96kHz, MONO→STEREO");
-                updateNotification("Running @ 96kHz");
-                
-                // Main loop
-                int loopCount = 0;
-                int consecutiveErrors = 0;
-                
-                while (isRecording && !Thread.interrupted()) {
-                    try {
-                        loopCount++;
-                        lastLoopTime = System.currentTimeMillis(); // Update watchdog
-                        
-                        // Read with state check
-                        if (audioRecord.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) {
-                            Log.e(TAG, "AudioRecord not recording! State: " + audioRecord.getRecordingState());
-                            audioRecord.startRecording();
-                            Thread.sleep(100);
-                            continue;
+                synchronized (audioLock) {
+                    // Create AudioTrack
+                    audioTrack = new AudioTrack(
+                        STREAM_TYPE, SAMPLE_RATE, CHANNEL_OUT,
+                        AUDIO_FORMAT, bufferSizeOut, AudioTrack.MODE_STREAM
+                    );
+                    
+                    if (audioTrack.getState() != AudioTrack.STATE_INITIALIZED) {
+                        Log.e(TAG, "AudioTrack init failed");
+                        return;
+                    }
+                    
+                    // Create AudioRecord
+                    audioRecord = new AudioRecord(
+                        RECORD_SOURCE, SAMPLE_RATE, CHANNEL_IN,
+                        AUDIO_FORMAT, bufferSizeIn
+                    );
+                    
+                    if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
+                        Log.e(TAG, "AudioRecord init failed");
+                        if (audioTrack != null) {
+                            audioTrack.release();
+                            audioTrack = null;
                         }
-                        
-                        int samplesRead = audioRecord.read(monoBuffer, 0, monoBuffer.length);
+                        return;
+                    }
+                    
+                    audioRecord.startRecording();
+                    audioTrack.play();
+                }
+                
+                Log.d(TAG, "Audio started @ 96kHz MONO→STEREO");
+                
+                int loopCount = 0;
+                
+                while (isRecording) {
+                    loopCount++;
+                    lastLoopTime = System.currentTimeMillis();
+                    
+                    // Get local references to avoid race condition
+                    AudioRecord record = audioRecord;
+                    AudioTrack track = audioTrack;
+                    
+                    if (record == null || track == null) {
+                        Log.w(TAG, "Audio objects null, exiting");
+                        break;
+                    }
+                    
+                    try {
+                        int samplesRead = record.read(monoBuffer, 0, monoBuffer.length);
                         
                         if (samplesRead > 0) {
-                            consecutiveErrors = 0;
-                            
                             // Convert MONO to STEREO
                             for (int i = 0; i < samplesRead; i++) {
                                 stereoBuffer[i * 2] = monoBuffer[i];
                                 stereoBuffer[i * 2 + 1] = monoBuffer[i];
                             }
                             
-                            // Write with state check
-                            if (audioTrack.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) {
-                                Log.e(TAG, "AudioTrack not playing! State: " + audioTrack.getPlayState());
-                                audioTrack.play();
-                                Thread.sleep(100);
-                                continue;
-                            }
+                            track.write(stereoBuffer, 0, samplesRead * 2);
                             
-                            int written = audioTrack.write(stereoBuffer, 0, samplesRead * 2);
-                            
-                            if (written < 0) {
-                                Log.e(TAG, "Write error: " + written);
-                                consecutiveErrors++;
-                            }
-                            
-                            // Log every 1000 loops
                             if (loopCount % 1000 == 0) {
-                                Log.d(TAG, "Loop " + loopCount + ": " + samplesRead + " mono samples → " + (samplesRead*2) + " stereo");
+                                Log.d(TAG, "Loop " + loopCount + ": " + samplesRead + " samples");
                             }
                             
-                        } else if (samplesRead == 0) {
-                            Log.w(TAG, "Read returned 0 samples");
-                            consecutiveErrors++;
+                        } else if (samplesRead < 0) {
+                            Log.e(TAG, "Read error: " + samplesRead);
                             Thread.sleep(50);
-                        } else {
-                            consecutiveErrors++;
-                            Log.e(TAG, "Read error: " + samplesRead + " (consecutive: " + consecutiveErrors + ")");
-                            
-                            if (consecutiveErrors > 10) {
-                                Log.e(TAG, "Restarting due to errors");
-                                audioRecord.stop();
-                                audioTrack.stop();
-                                Thread.sleep(500);
-                                audioRecord.startRecording();
-                                audioTrack.play();
-                                consecutiveErrors = 0;
-                            } else {
-                                Thread.sleep(100);
-                            }
                         }
                         
-                    } catch (Exception loopException) {
-                        consecutiveErrors++;
-                        Log.e(TAG, "Loop exception: " + loopException.getMessage(), loopException);
-                        
-                        if (consecutiveErrors > 50) {
-                            Log.e(TAG, "Too many exceptions, exiting");
-                            break;
-                        }
-                        
-                        try {
+                    } catch (Exception e) {
+                        if (isRecording) {
+                            Log.e(TAG, "Loop error: " + e.getMessage());
                             Thread.sleep(100);
-                        } catch (InterruptedException ie) {
+                        } else {
                             break;
                         }
                     }
                 }
                 
-                Log.d(TAG, "Audio loop exited. Total loops: " + loopCount);
+                Log.d(TAG, "Audio loop ended. Loops: " + loopCount);
                 
             } catch (Exception e) {
-                Log.e(TAG, "FATAL: Audio thread crashed", e);
-                updateNotification("Crashed: " + e.getMessage());
-            } catch (Throwable t) {
-                Log.e(TAG, "FATAL: Unexpected error", t);
-                updateNotification("Fatal error");
+                Log.e(TAG, "Audio thread error", e);
             } finally {
-                cleanup();
-                Log.d(TAG, "Audio thread ended");
+                synchronized (audioLock) {
+                    cleanup();
+                }
             }
-        });
-        
-        audioThread.setUncaughtExceptionHandler((thread, throwable) -> {
-            Log.e(TAG, "UNCAUGHT EXCEPTION", throwable);
         });
         
         audioThread.start();
@@ -291,42 +249,20 @@ public class AudioService extends Service {
     private void cleanup() {
         if (audioTrack != null) {
             try {
-                if (audioTrack.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
-                    audioTrack.stop();
-                }
+                audioTrack.stop();
                 audioTrack.release();
             } catch (Exception e) {
-                Log.e(TAG, "Error stopping AudioTrack", e);
             }
             audioTrack = null;
         }
         
         if (audioRecord != null) {
             try {
-                if (audioRecord.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING) {
-                    audioRecord.stop();
-                }
+                audioRecord.stop();
                 audioRecord.release();
             } catch (Exception e) {
-                Log.e(TAG, "Error stopping AudioRecord", e);
             }
             audioRecord = null;
-        }
-    }
-
-    private void updateNotification(String text) {
-        try {
-            NotificationManager manager = getSystemService(NotificationManager.class);
-            if (manager != null) {
-                Notification notification = new Notification.Builder(this)
-                        .setContentTitle("USB Audio Bridge")
-                        .setContentText(text)
-                        .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-                        .build();
-                manager.notify(1, notification);
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "Error updating notification", e);
         }
     }
 
@@ -341,19 +277,17 @@ public class AudioService extends Service {
         
         if (audioThread != null) {
             try {
-                audioThread.interrupt();
-                audioThread.join(2000);
+                audioThread.join(1000);
             } catch (InterruptedException e) {
-                Log.e(TAG, "Error waiting for thread", e);
             }
         }
         
-        cleanup();
+        synchronized (audioLock) {
+            cleanup();
+        }
         
-        // Release WakeLock
         if (wakeLock != null && wakeLock.isHeld()) {
             wakeLock.release();
-            Log.d(TAG, "WakeLock released");
         }
         
         // Auto-restart
@@ -361,7 +295,6 @@ public class AudioService extends Service {
             Intent restartIntent = new Intent(getApplicationContext(), AudioService.class);
             startService(restartIntent);
         } catch (Exception e) {
-            Log.e(TAG, "Error restarting service", e);
         }
         
         super.onDestroy();
