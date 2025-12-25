@@ -18,14 +18,11 @@ import android.util.Log;
 public class AudioService extends Service {
     private static final String TAG = "AudioService";
     
-    private AudioRecord audioRecord;
-    private AudioTrack audioTrack;
+    private volatile AudioRecord audioRecord;
+    private volatile AudioTrack audioTrack;
     private Thread audioThread;
-    private Thread watchdogThread;
-    private volatile boolean isRecording = false;
-    private volatile long lastLoopTime = 0;
+    private volatile boolean isRunning = false;
     private PowerManager.WakeLock wakeLock;
-    private final Object audioLock = new Object();
     
     private static final int SAMPLE_RATE = 96000;
     private static final int CHANNEL_IN = AudioFormat.CHANNEL_IN_MONO;
@@ -33,6 +30,7 @@ public class AudioService extends Service {
     private static final int AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT;
     private static final int RECORD_SOURCE = MediaRecorder.AudioSource.MIC;
     private static final int STREAM_TYPE = AudioManager.STREAM_MUSIC;
+    private static final int RESTART_INTERVAL_MS = 15000; // Restart every 15 seconds
 
     @Override
     public void onCreate() {
@@ -51,209 +49,171 @@ public class AudioService extends Service {
         
         Notification notification = new Notification.Builder(this)
                 .setContentTitle("USB Audio Bridge")
-                .setContentText("Running...")
+                .setContentText("Running @ 96kHz")
                 .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                 .build();
         
         startForeground(1, notification);
         
-        if (!isRecording) {
-            startAudioRouting();
-            startWatchdog();
+        if (!isRunning) {
+            startAudioLoop();
         }
         
         return START_STICKY;
     }
 
-    private void startWatchdog() {
-        watchdogThread = new Thread(() -> {
-            Log.d(TAG, "Watchdog started");
-            while (isRecording) {
-                try {
-                    Thread.sleep(15000);
-                    
-                    long timeSinceLastLoop = System.currentTimeMillis() - lastLoopTime;
-                    
-                    if (lastLoopTime > 0 && timeSinceLastLoop > 20000) {
-                        Log.w(TAG, "WATCHDOG: Audio hung for " + timeSinceLastLoop + "ms, restarting...");
-                        restartAudio();
-                    }
-                    
-                } catch (InterruptedException e) {
-                    break;
-                }
-            }
-            Log.d(TAG, "Watchdog stopped");
-        });
-        watchdogThread.start();
-    }
-
-    private void restartAudio() {
-        synchronized (audioLock) {
-            Log.d(TAG, "Restarting audio...");
-            
-            isRecording = false;
-            
-            if (audioThread != null) {
-                audioThread.interrupt();
-                try {
-                    audioThread.join(2000);
-                } catch (InterruptedException e) {
-                }
-            }
-            
-            cleanup();
-            
-            try {
-                Thread.sleep(500);
-            } catch (InterruptedException e) {
-            }
-            
-            startAudioRouting();
-        }
-    }
-
-    private void startAudioRouting() {
-        isRecording = true;
-        lastLoopTime = System.currentTimeMillis();
+    private void startAudioLoop() {
+        isRunning = true;
         
         audioThread = new Thread(() -> {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
             
-            try {
-                synchronized (audioLock) {
-                    int bufferSizeIn = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_IN, AUDIO_FORMAT);
-                    int bufferSizeOut = AudioTrack.getMinBufferSize(SAMPLE_RATE, CHANNEL_OUT, AUDIO_FORMAT);
-                    
-                    Log.d(TAG, "Buffers - In: " + bufferSizeIn + ", Out: " + bufferSizeOut);
-                    
-                    if (bufferSizeIn <= 0 || bufferSizeOut <= 0) {
-                        Log.e(TAG, "Invalid buffer sizes");
-                        return;
-                    }
-                    
-                    short[] monoBuffer = new short[bufferSizeIn / 2];
-                    short[] stereoBuffer = new short[bufferSizeIn];
-                    
-                    audioTrack = new AudioTrack(
-                        STREAM_TYPE, SAMPLE_RATE, CHANNEL_OUT,
-                        AUDIO_FORMAT, bufferSizeOut, AudioTrack.MODE_STREAM
-                    );
-                    
-                    if (audioTrack.getState() != AudioTrack.STATE_INITIALIZED) {
-                        Log.e(TAG, "AudioTrack init failed");
-                        return;
-                    }
-                    
-                    audioRecord = new AudioRecord(
-                        RECORD_SOURCE, SAMPLE_RATE, CHANNEL_IN,
-                        AUDIO_FORMAT, bufferSizeIn
-                    );
-                    
-                    if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
-                        Log.e(TAG, "AudioRecord init failed");
-                        cleanup();
-                        return;
-                    }
-                    
-                    audioRecord.startRecording();
-                    audioTrack.play();
-                    
-                    Log.d(TAG, "Audio started @ 96kHz MONO→STEREO");
+            int cycleCount = 0;
+            
+            while (isRunning) {
+                cycleCount++;
+                Log.d(TAG, "Audio cycle " + cycleCount + " starting...");
+                
+                try {
+                    runAudioCycle();
+                } catch (Exception e) {
+                    Log.e(TAG, "Audio cycle error", e);
                 }
                 
-                int loopCount = 0;
-                
-                while (isRecording && !Thread.interrupted()) {
-                    loopCount++;
-                    lastLoopTime = System.currentTimeMillis();
-                    
-                    synchronized (audioLock) {
-                        if (audioRecord == null || audioTrack == null) {
-                            Log.w(TAG, "Audio objects null, exiting loop");
-                            break;
-                        }
-                        
-                        short[] monoBuffer = new short[865];
-                        short[] stereoBuffer = new short[1730];
-                        
-                        int samplesRead = audioRecord.read(monoBuffer, 0, monoBuffer.length);
-                        
-                        if (samplesRead > 0) {
-                            for (int i = 0; i < samplesRead; i++) {
-                                stereoBuffer[i * 2] = monoBuffer[i];
-                                stereoBuffer[i * 2 + 1] = monoBuffer[i];
-                            }
-                            
-                            audioTrack.write(stereoBuffer, 0, samplesRead * 2);
-                            
-                            if (loopCount % 1000 == 0) {
-                                Log.d(TAG, "Loop " + loopCount);
-                            }
-                        } else if (samplesRead < 0) {
-                            Log.e(TAG, "Read error: " + samplesRead);
-                            Thread.sleep(100);
-                        }
-                    }
-                }
-                
-                Log.d(TAG, "Audio loop ended. Loops: " + loopCount);
-                
-            } catch (InterruptedException e) {
-                Log.d(TAG, "Audio thread interrupted");
-            } catch (Exception e) {
-                Log.e(TAG, "Audio error", e);
-            } finally {
-                synchronized (audioLock) {
-                    cleanup();
+                // Wait a bit before next cycle
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException e) {
+                    break;
                 }
             }
+            
+            Log.d(TAG, "Audio loop ended");
         });
         
         audioThread.start();
     }
 
-    private void cleanup() {
-        if (audioTrack != null) {
-            try {
-                audioTrack.stop();
-                audioTrack.release();
-            } catch (Exception e) {
-            }
-            audioTrack = null;
-        }
+    private void runAudioCycle() {
+        AudioRecord record = null;
+        AudioTrack track = null;
         
-        if (audioRecord != null) {
-            try {
-                audioRecord.stop();
-                audioRecord.release();
-            } catch (Exception e) {
+        try {
+            // Get buffer sizes
+            int bufferSizeIn = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_IN, AUDIO_FORMAT);
+            int bufferSizeOut = AudioTrack.getMinBufferSize(SAMPLE_RATE, CHANNEL_OUT, AUDIO_FORMAT);
+            
+            if (bufferSizeIn <= 0 || bufferSizeOut <= 0) {
+                Log.e(TAG, "Invalid buffer sizes");
+                return;
             }
-            audioRecord = null;
+            
+            // Create buffers
+            short[] monoBuffer = new short[865];
+            short[] stereoBuffer = new short[1730];
+            
+            // Create AudioTrack
+            track = new AudioTrack(
+                STREAM_TYPE, SAMPLE_RATE, CHANNEL_OUT,
+                AUDIO_FORMAT, bufferSizeOut, AudioTrack.MODE_STREAM
+            );
+            
+            if (track.getState() != AudioTrack.STATE_INITIALIZED) {
+                Log.e(TAG, "AudioTrack init failed");
+                return;
+            }
+            
+            // Create AudioRecord
+            record = new AudioRecord(
+                RECORD_SOURCE, SAMPLE_RATE, CHANNEL_IN,
+                AUDIO_FORMAT, bufferSizeIn
+            );
+            
+            if (record.getState() != AudioRecord.STATE_INITIALIZED) {
+                Log.e(TAG, "AudioRecord init failed");
+                if (track != null) {
+                    track.release();
+                }
+                return;
+            }
+            
+            // Start
+            record.startRecording();
+            track.play();
+            
+            Log.d(TAG, "Audio active");
+            
+            // Run for 15 seconds then recreate
+            long startTime = System.currentTimeMillis();
+            int loopCount = 0;
+            
+            while (isRunning && (System.currentTimeMillis() - startTime) < RESTART_INTERVAL_MS) {
+                loopCount++;
+                
+                // Read mono
+                int samplesRead = record.read(monoBuffer, 0, monoBuffer.length);
+                
+                if (samplesRead > 0) {
+                    // Convert to stereo
+                    for (int i = 0; i < samplesRead; i++) {
+                        stereoBuffer[i * 2] = monoBuffer[i];
+                        stereoBuffer[i * 2 + 1] = monoBuffer[i];
+                    }
+                    
+                    // Write stereo
+                    track.write(stereoBuffer, 0, samplesRead * 2);
+                    
+                    if (loopCount % 1000 == 0) {
+                        Log.d(TAG, "Loop " + loopCount);
+                    }
+                } else if (samplesRead < 0) {
+                    Log.e(TAG, "Read error: " + samplesRead);
+                    break;
+                }
+            }
+            
+            Log.d(TAG, "Cycle complete. Loops: " + loopCount + ", recreating...");
+            
+        } catch (Exception e) {
+            Log.e(TAG, "Cycle exception", e);
+        } finally {
+            // Clean up this cycle's objects
+            if (track != null) {
+                try {
+                    track.stop();
+                    track.release();
+                } catch (Exception e) {
+                }
+            }
+            
+            if (record != null) {
+                try {
+                    record.stop();
+                    record.release();
+                } catch (Exception e) {
+                }
+            }
         }
     }
 
     @Override
     public void onDestroy() {
         Log.d(TAG, "Service stopping");
-        isRecording = false;
-        
-        if (watchdogThread != null) {
-            watchdogThread.interrupt();
-        }
+        isRunning = false;
         
         if (audioThread != null) {
             audioThread.interrupt();
-        }
-        
-        synchronized (audioLock) {
-            cleanup();
+            try {
+                audioThread.join(2000);
+            } catch (InterruptedException e) {
+            }
         }
         
         if (wakeLock != null && wakeLock.isHeld()) {
             wakeLock.release();
         }
         
+        // Auto-restart
         try {
             Intent restartIntent = new Intent(getApplicationContext(), AudioService.class);
             startService(restartIntent);
